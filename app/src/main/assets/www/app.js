@@ -64,7 +64,15 @@ function stopBeatTimer() { clearInterval(_beatTimer); _beatTimer = null; }
 /* 스크롤 중에는 배경 캔버스를 다시 그리지 않는다 — 캔버스 갱신이 backdrop blur/네이티브 글래스 재합성을 유발해
    스크롤 프레임을 깎는다. 오브 이동은 매우 느려 160ms 정지는 눈에 띄지 않는다. */
 window.__lastScrollAt = 0;
-addEventListener('scroll', () => { window.__lastScrollAt = performance.now(); }, { passive: true, capture: true });
+let _scrT = 0;
+addEventListener('scroll', () => {
+    window.__lastScrollAt = performance.now();
+    /* 스크롤 중엔 무한 애니메이션을 멈춰 합성 부하를 줄인다 (class 는 상태가 바뀔 때만 토글) */
+    const h = document.documentElement; if (!h.classList.contains('scrolling')) h.classList.add('scrolling');
+    clearTimeout(_scrT); _scrT = setTimeout(() => h.classList.remove('scrolling'), 140);
+}, { passive: true, capture: true });
+/* 오래 켜 둘수록 쌓이는 만료된 응답 캐시 정리 (5분마다, 백그라운드에선 건너뜀) */
+setInterval(() => { if (window.__bgMode) return; const n = Date.now(); for (const [k, v] of _qc) if (n - v.at > 900000) _qc.delete(k); }, 300000);
 
 let _bgRafId = null;
 let _npElRef = null;
@@ -94,7 +102,7 @@ function bgLoop() {
     // 실제 그리기는 3프레임에 1번(20fps, 일시정지 시 ~7fps). 매 프레임 전체 화면을 다시 그리면 WebView 합성과
     // 네이티브 글래스(배경 캡처·블러)까지 60fps 로 다시 계산되어 시간이 지날수록 부하/발열이 커진다.
     // 일시정지 중에는 오브 이동이 프레임당 1px 미만이고 위에 blur(120px) 오버레이가 덮여 있어 10fps 로도 구분이 안 된다.
-    if (BG.f % (BG.playing ? 3 : 8)) return;
+    if (BG.f % (BG.playing ? 4 : 8) || document.hidden) return;
     if (performance.now() - window.__lastScrollAt < 160) return;   // 스크롤 중엔 그리기 생략
     // 전체화면 플레이어(#np, 불투명)가 덮고 있는 동안엔 보이지 않으므로 그리지 않는다.
     if (_npIsOpen()) return;
@@ -1284,7 +1292,7 @@ function cachedCall(p, ttl = 900000) {
     if (h && Date.now() - h.at < ttl) return h.p;
     const pr = callCs({ ...p });
     _qc.set(k, { at: Date.now(), p: pr });
-    if (_qc.size > 80) _qc.delete(_qc.keys().next().value);
+    if (_qc.size > 40) _qc.delete(_qc.keys().next().value);
     pr.catch(() => { if (_qc.get(k)?.p === pr) _qc.delete(k); });
     return pr;
 }
@@ -1461,20 +1469,21 @@ async function doSearch(query) {
     const area = document.getElementById('s-res');
     area.innerHTML = `<div class="state"><div class="spinner"></div><p style="margin-top:12px">검색 중...</p></div>`;
     _sStack.length = 0; _sRender = null; _miMode(false);
-    /* 영상 검색(기존 그대로: 쿼리에 키워드를 덧붙이지 않음)과 곡/아티스트/앨범 검색을 동시에 요청 */
+    /* 정식 발매곡(곡/아티스트/앨범)만 먼저 검색 — 일반 영상 검색은 결과가 전혀 없을 때만 폴백으로 사용(요청·렌더 비용 절감) */
     const mq = kind => cachedCall({ type: 'musicSearch', kind, query: q }, 300000);
-    const [vr, sr, ar, br] = await Promise.allSettled([
-        cachedCall({ type: 'search', query: q }, 300000), mq('song'), mq('artist'), mq('album')]);
-    const songs = sr.status === 'fulfilled' ? (sr.value.items || []) : [];
-    const sid = new Set(songs.map(t => t.id));
+    const [sr, ar, br] = await Promise.allSettled([mq('song'), mq('artist'), mq('album')]);
     const d = {
-        songs,
+        songs: sr.status === 'fulfilled' ? (sr.value.items || []) : [],
         artists: ar.status === 'fulfilled' ? (ar.value.items || []) : [],
         albums: br.status === 'fulfilled' ? (br.value.items || []) : [],
-        videos: vr.status === 'fulfilled' ? sortMusicFirst(vr.value.tracks || []).filter(t => !sid.has(t.id)) : []
+        videos: []
     };
+    let err = '';
+    if (!d.songs.length && !d.artists.length && !d.albums.length) {
+        try { const vr = await cachedCall({ type: 'search', query: q }, 300000); d.videos = sortMusicFirst(vr.tracks || []); }
+        catch (e) { err = e?.message || ''; }
+    }
     if (!d.songs.length && !d.artists.length && !d.albums.length && !d.videos.length) {
-        const err = vr.status === 'rejected' ? vr.reason?.message : '';
         area.innerHTML = err ? `<div class="state"><h3>검색 실패</h3><p>${esc(err)}</p></div>`
             : `<div class="state"><h3>결과 없음</h3><p>다른 검색어를 시도해보세요</p></div>`;
         return;
@@ -1484,13 +1493,24 @@ async function doSearch(query) {
 }
 
 /* ── 아티스트 / 앨범 상세 ── */
+const _nzs = x => (x || '').toLowerCase().replace(/[\(\[][^\)\]]*[\)\]]/g, '').replace(/\s*-\s*(single|ep|싱글)\s*$/i, '').replace(/[^\p{L}\p{N}]+/gu, '');
 async function _miFallback(kind, id, hint) {
     if (!hint?.name) return null;
     const q = [hint.name, kind === 'album' ? hint.artist : ''].filter(Boolean).join(' ');
     const r = await cachedCall({ type: 'musicSearch', kind, query: q }, 300000);
-    const nm = hint.name.trim().toLowerCase();
-    const it = (r.items || []).find(x => x.id !== id && (x.name || '').trim().toLowerCase() === nm);
-    return it ? cachedCall({ type: 'musicBrowse', browseId: it.id }) : null;
+    const nm = _nzs(hint.name), ar = _nzs(hint.artist), items = r.items || [];
+    const arOk = x => !ar || !x.artist || _nzs(x.artist).includes(ar) || ar.includes(_nzs(x.artist));
+    const it = items.find(x => _nzs(x.name) === nm && arOk(x)) || items.find(x => _nzs(x.name) === nm)
+        || items.find(x => { const n = _nzs(x.name); return n && nm && (n.includes(nm) || nm.includes(n)); });
+    if (it && it.id !== id) { try { return await cachedCall({ type: 'musicBrowse', browseId: it.id }); } catch { } }
+    if (kind !== 'album') return null;
+    /* 앨범 페이지를 못 열면(HTTP 400 등) 곡 검색 결과에서 같은 앨범의 수록곡으로 직접 구성 */
+    const sr = await cachedCall({ type: 'musicSearch', kind: 'song', query: q }, 300000);
+    const songs = (sr.items || []).filter(t => t.albumId === id || (t.album && _nzs(t.album) === nm));
+    if (!songs.length) return null;
+    const f = songs[0];
+    return { name: hint.name, thumb: f.art || it?.thumb || '', artist: f.channel || hint.artist || '', artistId: f.artistId || '', year: f.year || '', label: '',
+        desc: '', sections: [{ title: '곡', items: songs }] };
 }
 async function miOpen(kind, id, hint) {
     if (!id) return;
