@@ -5594,3 +5594,8 @@ html.glass-native .c-dur {
 .mi-pop-box { width: 100%; max-width: 420px; max-height: 72vh; display: flex; flex-direction: column; gap: 12px; padding: 18px; border-radius: 18px; background: #1c1c1e; box-shadow: 0 20px 60px rgba(0,0,0,.6); }
 .mi-pop-h { font-size: 17px; font-weight: 700; overflow-wrap: anywhere; }
 .mi-pop-body { flex: 1; min-height: 0; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.65; color: rgba(255,255,255,.82); -webkit-overflow-scrolling: touch; }
+
+/* 성능: 긴 목록은 화면 밖 렌더링 생략 + 스크롤 중 무한 애니메이션 일시정지 */
+.mi-row { content-visibility: auto; contain-intrinsic-size: auto 60px; }
+.mi-al, .mi-ac { contain: layout paint style; }
+html.scrolling *, html.scrolling *::before, html.scrolling *::after { animation-play-state: paused !important; }
